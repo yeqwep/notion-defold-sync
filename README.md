@@ -1,7 +1,7 @@
 # Notion to Defold Sync Tool
 
 Sync Notion databases directly into Defold projects
-as Lua tables or JSON with one click.
+as Lua tables or JSON.
 
 ![Banner](docs/images/banner.png)
 ---
@@ -10,7 +10,7 @@ as Lua tables or JSON with one click.
 
 This is a **Defold Editor Script** that allows you to directly import Notion databases into a Defold project and export them as **Lua tables** or **JSON**, optimized for in-game usage.
 
-Game data such as item masters, enemy stats, and localized text can be managed in Notion and seamlessly synced with a single click from the Defold editor—no external tools required.
+Game data such as item masters, enemy stats, and localized text can be managed in Notion and synced from within the Defold Editor—without relying on external tools.
 
 ![Overview Screenshot](docs/images/overview.png)
 
