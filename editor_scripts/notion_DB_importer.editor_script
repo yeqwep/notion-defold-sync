@@ -1,0 +1,477 @@
+local M = {}
+-- Config file
+local CONFIG_PATH = "editor_scripts/notion_config.lua"
+-- -- ----------------------------------------------
+-- Utilities
+-- -- ----------------------------------------------
+local function file_exists(path)
+    local attr = editor.resource_attributes(path)
+    return attr and attr.exists
+end
+
+-- Get the absolute path of the project's root directory
+local function get_project_root()
+    local attr = editor.external_file_attributes(".")
+    return attr and attr.path and attr.path:gsub("\\", "/") or ""
+end
+
+-- Extract the 32-character ID from the URL
+local function extract_db_id(url)
+    if not url or url == "" then return nil end
+    return url:match("(%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x)")
+end
+
+-- Process the selected path (Only in the project)
+local function normalize_selected_path(path)
+    if not path then return "" end
+    path = path:gsub("\\", "/")
+
+    local root = get_project_root()
+
+    local s, e = path:find(root, 1, true)
+    if s == 1 then
+        local relative = path:sub(e + 1)
+        if relative == "" or relative:sub(1, 1) ~= "/" then
+            relative = "/" .. relative
+        end
+        return relative
+    end
+    return path
+end
+
+local function serialize_lua(data)
+    local function dump(o, level)
+        level = level or 0
+        local indent = string.rep("    ", level)         -- Current indent
+        local next_indent = string.rep("    ", level + 1) -- Next level indent
+
+        if type(o) == 'table' then
+            local parts = {}
+            local processed_keys = {}
+            -- Array part (1, 2, 3...)
+            for i, v in ipairs(o) do
+                table.insert(parts, next_indent .. dump(v, level + 1))
+                processed_keys[i] = true
+            end
+            -- Hash part (collect keys and sort)
+            local keys = {}
+            for k, _ in pairs(o) do
+                if not processed_keys[k] then
+                    table.insert(keys, k)
+                end
+            end
+            -- Sort keys alphabetically/numerically
+            table.sort(keys, function(a, b)
+                if type(a) ~= type(b) then return type(a) < type(b) end
+                return a < b
+            end)
+            -- Output in sorted order
+            for _, k in ipairs(keys) do
+                local v = o[k]
+                local key_str
+                if type(k) == 'string' and k:match("^[%a_][%w_]*$") then
+                    key_str = k
+                elseif type(k) == 'string' then
+                    key_str = '["' .. k .. '"]'
+                else
+                    key_str = '[' .. tostring(k) .. ']'
+                end
+                table.insert(parts, next_indent .. key_str .. ' = ' .. dump(v, level + 1))
+            end
+            -- Return "{}" for empty tables
+            if #parts == 0 then return "{}" end
+            -- Format and concatenate
+            return "{\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "}"
+        elseif type(o) == 'string' then
+            -- Escape processing
+            o = o:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n')
+            return '"' .. o .. '"'
+        elseif type(o) == 'number' then
+            return tostring(o)
+        elseif type(o) == 'boolean' then
+            return tostring(o)
+        else
+            return tostring(o)
+        end
+    end
+    return "return " .. dump(data, 0)
+end
+
+-- Function to parse a string and automatically convert it to appropriate types (number, boolean, nil)
+local function parse_string_value(val)
+    if type(val) ~= "string" then return val end
+    
+    -- 1. Check if it can be converted to a number
+    local num = tonumber(val)
+    if num then return num end
+    -- 2. Check for boolean or nil
+    local lower_val = val:lower()
+    if lower_val == "true" then
+        return true
+    elseif lower_val == "false" then
+        return false
+    elseif lower_val == "nil" then
+        return nil
+    end
+    
+    return val
+end
+
+-- Function to flatten Notion types, extract values, and convert types
+local function extract_value(prop)
+    if not prop or not prop.type then return nil end
+    local t = prop.type
+
+    if t == "title" or t == "rich_text" then
+        local val = prop[t][1] and prop[t][1].plain_text or ""
+        return parse_string_value(val)
+    elseif t == "number" then
+        return prop.number
+    elseif t == "checkbox" then
+        return prop.checkbox
+    elseif t == "select" then
+        local val = prop.select and prop.select.name or nil
+        return val and parse_string_value(val) or nil
+    elseif t == "multi_select" then
+        local vals = {}
+        for _, item in ipairs(prop.multi_select) do 
+            local parsed_val = parse_string_value(item.name)
+            if parsed_val ~= nil then
+                table.insert(vals, parsed_val)
+            end
+        end
+        return vals
+    elseif t == "rollup" then
+        local rollup_type = prop.rollup.type
+        if rollup_type == "array" then
+            local vals = {}
+            for _, item in ipairs(prop.rollup.array) do
+                local parsed_val = extract_value(item)
+                if parsed_val ~= nil then table.insert(vals, parsed_val) end
+            end
+            return vals
+        elseif rollup_type == "number" then
+            return prop.rollup.number
+        end
+    end
+
+    return nil
+end
+
+-- Function to filter and format properties (Exclude @)
+local function process_properties(properties)
+    local entry = {}
+    for prop_name, prop_data in pairs(properties) do
+        -- Process only if the property name does not start with '@'
+        if prop_name:sub(1, 1) ~= "@" then
+            entry[prop_name] = extract_value(prop_data)
+        end
+    end
+    return entry
+end
+
+-- Function to format all fetched data
+local function process_notion_data(results)
+    local clean_data = {}
+
+    for _, page in ipairs(results) do
+        local entry = process_properties(page.properties)
+        -- Process "key" property
+        if entry["key"] then
+            local key_val = entry["key"]
+            entry["key"] = nil
+            clean_data[key_val] = entry
+        else
+            -- Add as an array if there is no key
+            table.insert(clean_data, entry)
+        end
+    end
+
+    return clean_data
+end
+
+-- Sync execution function
+local function run_sync(token, db_id, file_path, is_lua)
+    local url = "https://api.notion.com/v1/databases/" .. db_id .. "/query"
+    local headers = {
+        ["Authorization"] = "Bearer " .. token,
+        ["Notion-Version"] = "2022-06-28",
+        ["Content-Type"] = "application/json"
+    }
+
+    local all_results = {}
+    local has_more = true
+    local next_cursor = nil
+    local page_count = 0
+
+    -- Loop to fetch all pages
+    while has_more do
+        local body_data = {}
+        if next_cursor then
+            body_data.start_cursor = next_cursor
+        end
+        
+        local json_body = json.encode(body_data)
+
+        local response = http.request(url, {
+            method = "POST",
+            as = "json",
+            headers = headers,
+            body = json_body
+        })
+
+        if response.status == 200 and response.body then
+            local data = response.body
+            
+            for _, page in ipairs(data.results) do
+                table.insert(all_results, page)
+            end
+            
+            has_more = data.has_more
+            next_cursor = data.next_cursor
+            page_count = page_count + 1
+            print("Fetched page " .. page_count .. " (" .. #data.results .. " items)")
+        else
+            print("Sync Failed at page " .. (page_count + 1) .. ". Status: " .. tostring(response.status))
+            return 
+        end
+    end
+    print("Total items fetched: " .. #all_results)
+
+    local clean_data = process_notion_data(all_results)
+
+    local serialize_data = serialize_lua(clean_data)
+    local content = is_lua and serialize_data or json.encode(clean_data)
+
+    local attr = editor.resource_attributes(file_path)
+    if not attr.exists then
+        editor.create_resources({ { file_path, content } })
+    else
+        editor.transact({ editor.tx.set(file_path, "text", content) })
+    end
+    editor.save()
+    print("Sync Successful (Resource): " .. file_path)
+end
+
+-- Function to validate database information
+local function perform_validation(token, db_id)
+    if not token or token == "" or not db_id or db_id == "" then
+        return false, "Incomplete input", nil
+    end
+
+    local url = "https://api.notion.com/v1/databases/" .. db_id
+    local res = http.request(url, {
+        method = "GET",
+        as = "json",
+        headers = {
+            ["Authorization"] = "Bearer " .. token,
+            ["Notion-Version"] = "2022-06-28"
+        }
+    })
+
+    if res.status == 200 and res.body then
+        local name = res.body.title and res.body.title[1] and res.body.title[1].plain_text
+        return true, 'DB Title "' .. (name or "Untitled") .. '"', name
+    else
+        return false, "Error: " .. res.status, nil
+    end
+end
+
+-- Function to update the config file
+local function update_config(token, dir, is_lua)
+    local content = "local M = {}\n" ..
+        'M.NOTION_TOKEN = "' .. token .. '"\n' ..
+        'M.SAVE_FOLDER = "' .. dir .. '"\n' ..
+        'M.SAVE_AS_LUA = ' .. tostring(is_lua) .. '\n' ..
+        "return M"
+
+    local wf = io.open(CONFIG_PATH, "w")
+    if wf then
+        wf:write(content)
+        wf:close()
+    else
+        print("Error: Could not write to " .. CONFIG_PATH)
+    end
+end
+
+-- Load the config file and set to config table
+local function load_config()
+    local f = io.open(CONFIG_PATH, "r")
+    if f then
+        local chunk = f:read("*a")
+        f:close()
+        if chunk == "" then
+            print("Error: Config file is empty.")
+            return nil
+        end
+        local func, err = load(chunk)
+        if func then
+            local ok, result = pcall(func)
+            if ok and type(result) == "table" then
+                return result
+            else
+                print("Error: loading config: " .. tostring(result))
+                return nil
+            end
+        else
+            print("Error: compiling config: " .. tostring(err))
+            return nil
+        end
+    else
+        update_config("", "/assets", false)
+        return "default"
+    end
+end
+-- -- ----------------------------------------------
+-- Main Functions
+-- -- ----------------------------------------------
+function M.get_commands()
+    return {
+        {
+            label = "Sync from Notion URL",
+            locations = { "Project" },
+            run = function()
+                local config = load_config()
+                if config == nil then return end
+                local separator = editor.platform == "x86_64-win32" and "\\" or "/"
+
+                local setup_ui = editor.ui.component(function(props)
+                    local token, set_token = editor.ui.use_state(config.NOTION_TOKEN or "")
+                    local out_dir, set_out_dir = editor.ui.use_state(config.SAVE_FOLDER or "")
+                    local is_lua, set_is_lua = editor.ui.use_state(config.SAVE_AS_LUA or false)
+                    local url, set_url = editor.ui.use_state("")
+                    local file_name, set_file_name = editor.ui.use_state("file name")
+                    local status_msg, set_status_msg = editor.ui.use_state("Waiting for valid Token and DB URL...")
+                    local is_valid, set_is_valid = editor.ui.use_state(false)
+
+                    local db_id = editor.ui.use_memo(extract_db_id, url)
+                    local url_msg = "Database URL:"
+                    if db_id then
+                        url_msg = "Database URL: Check id ... " .. db_id
+                    end
+
+                    -- Checks involving communication are performed when the button is pressed
+                    local on_check_connection = function()
+                        set_status_msg("Checking...".. db_id)
+                        local ok, msg, name = perform_validation(token, db_id)
+                        set_is_valid(ok)
+                        if ok then
+                            set_status_msg(msg)
+                        else
+                            set_status_msg(msg)
+                        end
+                        if name then
+                            set_file_name(name:gsub("%s+", "_"):lower())
+                        else
+                            set_file_name("untitled")
+                        end
+                    end
+
+                    -- Show directory selection dialog
+                    local on_select_dir = function()
+                        local path = editor.ui.show_external_directory_dialog({
+                            title = "Select Output Directory"
+                        })
+                        if path then
+                            local normalized = normalize_selected_path(path)
+                            set_out_dir(normalized)
+                        end
+                    end
+
+                    return editor.ui.dialog({
+                        title = "Notion Sync Setup",
+                        content = editor.ui.vertical({
+                            padding = editor.ui.PADDING.LARGE,
+                            spacing = editor.ui.SPACING.MEDIUM,
+                            children = {
+                                editor.ui.label({ text = "API Token:" }),
+                                editor.ui.string_field({ value = token, on_value_changed = set_token }),
+
+                                editor.ui.label({ text = url_msg }),
+                                editor.ui.string_field({ value = url, on_value_changed = set_url }),
+
+                                editor.ui.horizontal({
+                                    children = {
+                                        editor.ui.label({
+                                            text = "Status: " .. status_msg,
+                                            color = is_valid and editor.ui.COLOR.TEXT or editor.ui.COLOR.ERROR
+                                        }),
+                                        editor.ui.button({ text = "Verify & Fetch Name", on_pressed = on_check_connection, enabled =
+                                        db_id ~= nil })
+                                    }
+                                }),
+
+                                editor.ui.label({ text = "Output Directory:" }),
+                                editor.ui.horizontal({
+                                    children = {
+                                        editor.ui.string_field({ value = out_dir, grow = true, enabled = false }),
+                                        editor.ui.button({ text = "Select", on_pressed = on_select_dir })
+                                    }
+                                }),
+
+                                editor.ui.label({
+                                    text = "Output File Name(" ..
+                                        out_dir .. separator .. file_name .. (is_lua and ".lua" or ".json") .. "):"
+                                }),
+                                editor.ui.string_field({ value = file_name, on_value_changed = set_file_name }),
+
+                                editor.ui.horizontal({
+                                    children = {
+                                        editor.ui.check_box({ value = is_lua, on_value_changed = set_is_lua }),
+                                        editor.ui.label({ text = "Output as Lua Table (.lua)" }),
+                                    }
+                                })
+                            }
+                        }),
+                        buttons = {
+                            editor.ui.dialog_button({ text = "Cancel", cancel = true }),
+                            editor.ui.dialog_button({
+                                text = "Sync Now",
+                                default = true,
+                                enabled = is_valid,
+                                result = { token = token, db_id = db_id, file_name = file_name, out_dir = out_dir, is_lua = is_lua }
+                            })
+                        }
+                    })
+                end)
+                local res = editor.ui.show_dialog(setup_ui({}))
+                if res then
+                    -- Build file path
+                    local ext = res.is_lua and ".lua" or ".json"
+                    local file_path = res.out_dir .. separator .. res.file_name .. ext
+                    -- Existing file check and overwrite confirmation dialog
+                    local button_result = true
+                    if file_exists(file_path) then
+                        button_result = editor.ui.show_dialog(editor.ui.dialog({
+                            title = "Overwrite it?",
+                            buttons = {
+                                editor.ui.dialog_button({
+                                    text = "Cancel",
+                                    default = true,
+                                    cancel = true,
+                                    result = false
+                                }),
+                                editor.ui.dialog_button({
+                                    text = "Overwrite it",
+                                    result = true
+                                })
+
+                            }
+                        }))
+                    end
+                    if button_result then
+                        -- Execute sync process
+                            run_sync(res.token, res.db_id, file_path, res.is_lua)
+                            update_config(res.token, res.out_dir, res.is_lua)
+                        
+                    else
+                        print("Process canceled.")
+                    end
+                end
+
+            end
+        }
+    }
+end
+
+return M

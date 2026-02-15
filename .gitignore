@@ -1,0 +1,11 @@
+# Defold standard ignore
+/.internal/
+/build/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# ⚠️ Notion API Token config
+notion_config.lua
+editor_scripts/notion_config.lua
