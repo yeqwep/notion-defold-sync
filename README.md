@@ -78,7 +78,7 @@ To use the Notion API, you need a Notion integration (API token).
 5. Choose the output format (**Lua** or **JSON**) and click **Sync Now**.
 
 **📝Note:**
-The API token, database URL, and output directory are saved locally in `notion_config.lua`, so you won’t need to re-enter them next time.  
+The API token and output directory are saved locally in `notion_config.lua`, so you won’t need to re-enter them next time.  
 ⚠️ **Be careful not to share this file with others!**
 
 
